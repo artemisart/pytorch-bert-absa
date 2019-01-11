@@ -1,12 +1,17 @@
 import json
+from typing import List, TypeVar
 from collections import Counter
 from pathlib import Path
 
 import attr
 import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm, trange
 
-from pytorch_pretrained_bert import BertModel
+from pytorch_pretrained_bert import BertForMaskedLM, BertForTokenClassification, BertAdam
 from tokenization import BertTokenizer
+
+T = TypeVar('T')
 
 MODEL = 'bert-base-uncased'
 
@@ -19,7 +24,10 @@ tokenizer = BertTokenizer.from_pretrained(
 LOCATIONS = ['LOCATION1', 'LOCATION2']
 for loc in LOCATIONS:
     tokenizer.vocab[loc] = tokenizer.vocab['[MASK]']
+
+CLS = tokenizer.vocab['[CLS]']
 SEP = tokenizer.vocab['[SEP]']
+
 
 @attr.s(auto_attribs=True, slots=True)
 class Example:
@@ -27,11 +35,12 @@ class Example:
 
     id: int
     text: str
-    segment_ids: [int]
+    token_ids: List[int]  # CLS + text + SEP + aspect + SEP
     target: str
-    target_idx: int
+    target_idx: int  # in token_ids
     aspect: str
     sentiment: str
+    label: int  # sentiment as an int
 
 
 @attr.s(auto_attribs=True, slots=True)
@@ -92,6 +101,54 @@ def load_sentihood(path: Path):
     return ds
 
 
+def segment_ids_from_token_ids(token_ids):
+    """We want all 0s before, and including, the first SEP and 1s after that if there are remaining tokens"""
+    first = token_ids.index(SEP)
+    return [int(i > first) for i in range(len(token_ids))]
+
+
+def pad(arr: List[T], maxlen: int, value: T):
+    """len(arr) must be <= maxlen"""
+    return arr + [value for _ in range(maxlen - len(arr))]
+
+
+def create_batch(examples: List[Example]):
+    maxlen = max(len(ex.token_ids) for ex in examples)
+    tokens = [pad(ex.token_ids, maxlen, 0) for ex in examples]
+    segments = [pad(segment_ids_from_token_ids(toks), maxlen, 1) for toks in tokens]
+    mask = [pad([1 for _ in tok], maxlen, 0) for tok in tokens]
+    # -100 == ignore_index of the cross entropy loss
+    labels = [[-100 if i != ex.target_idx else ex.label for i in range(maxlen)] for ex in examples]
+    return (
+        torch.tensor(tokens),
+        torch.tensor(segments),
+        torch.tensor(mask),
+        torch.tensor(labels),
+    )
+
+def train(model, data_loader, epochs):
+    param_optimizer = list(model.named_parameters())
+    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    optimizer_grouped_parameters = [
+        {'params': [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
+        {'params': [p for n, p in param_optimizer if any(nd in n for nd in no_decay)], 'weight_decay': 0.0}
+        ]
+    
+    optimizer = BertAdam(optimizer_grouped_parameters,
+                             lr=args.learning_rate,
+                             warmup=args.warmup_proportion,
+                             t_total=t_total)
+
+    model.train()
+
+    for epoch in trange(epochs, desc="Epoch"):
+        for step, batch in enumerate(tqdm(data_loader, desc="Iteration")):
+            loss = model(*batch)
+            print("loss", loss)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
 def main(data_dir: Path):
     ds = load_sentihood(data_dir)
 
@@ -110,9 +167,12 @@ def main(data_dir: Path):
 
     aspects = {'general': 0, 'price': 1, 'transit-location': 2, 'safety': 3}
     aspects_token_ids = {
-        aspect: tokenizer.convert_tokens_to_ids(tokenizer.tokenize(aspect.replace('-', ' ')))
+        aspect: tokenizer.convert_tokens_to_ids(
+            tokenizer.tokenize(aspect.replace('-', ' '))
+        )
         for aspect in aspects
     }
+    sentiments = {'None': 0, 'Positive': 1, 'Negative': 2}
 
     ds.print_head()
 
@@ -134,29 +194,45 @@ def main(data_dir: Path):
                 yield Example(
                     id=ex['id'],
                     text=ex['text'],
-                    segment_ids=ids + [SEP] + aspects_token_ids[aspect],
+                    token_ids=[CLS] + ids + [SEP] + aspects_token_ids[aspect] + [SEP],
                     target=target,
-                    target_idx=target_idx,
+                    target_idx=1 + target_idx,  # 1 offset for CLS
                     aspect=aspect,
                     sentiment=sentiment_or_none,
+                    label=sentiments[sentiment_or_none],
                 )
 
     processed = ds.map_many(flatten_aspects)
 
     processed.print_head()
 
-    model = BertModel.from_pretrained(MODEL)
-    model.eval()
+    lm = BertForMaskedLM.from_pretrained(MODEL)
+    lm.eval()
+    model = BertForTokenClassification.from_pretrained(MODEL, num_labels=3)
+    # 3 labels for None/neutral, Positive, Negative
 
     for ex in processed.train:
-        tensor = torch.tensor([ex.segment_ids])
+        tokens_tensor = torch.tensor([ex.token_ids])
+        segments_tensor = torch.tensor([segment_ids_from_token_ids(ex.token_ids)])
+        print(tokens_tensor)
+        print(segments_tensor)
 
-        predictions, _ = model(tensor)
+        predictions = lm(tokens_tensor)
         print(predictions)
         predicted_index = torch.argmax(predictions[0, ex.target_idx]).item()
-        predicted_token = tokenizer.convert_ids_to_tokens(predicted_index)
+        predicted_token = tokenizer.convert_ids_to_tokens([predicted_index])
 
         print(predicted_index)
         print(predicted_token)
-        
+        print(tokenizer.convert_ids_to_tokens(ex.token_ids), ex.text)
+
+        print(model(*create_batch([ex])))
+
         break
+
+    loader = DataLoader(
+        processed.train, batch_size=4, shuffle=True, collate_fn=create_batch
+    )
+
+    train(model, loader)
+
