@@ -6,6 +6,8 @@ name = "pypi"
 [packages]
 pytorch-pretrained-bert = "*"
 attrs = "*"
+tensorboardx = "*"
+sklearn = "*"
 
 [dev-packages]
 
