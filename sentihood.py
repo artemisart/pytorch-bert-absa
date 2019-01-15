@@ -1,5 +1,6 @@
 import json
 from collections import Counter
+from functools import partial
 from pathlib import Path
 from typing import List, TypeVar
 
@@ -20,6 +21,7 @@ from tokenization import BertTokenizer
 
 T = TypeVar('T')
 
+ARGS = None
 MODEL = 'bert-base-uncased'
 
 tokenizer = BertTokenizer.from_pretrained(
@@ -36,8 +38,12 @@ CLS = tokenizer.vocab['[CLS]']
 SEP = tokenizer.vocab['[SEP]']
 
 writer = SummaryWriter()
-_scorers = ['accuracy', 'f1_macro', 'precision_macro', 'recall_macro']
-scorers = {name: metrics.get_scorer(name) for name in _scorers}
+scorers = {
+    'accuracy': metrics.accuracy_score,
+    'f1_micro': partial(metrics.f1_score, average='micro'),
+    'f1_macro': partial(metrics.f1_score, average='macro'),
+    'f1_weighted': partial(metrics.f1_score, average='weighted'),
+}
 
 
 @attr.s(auto_attribs=True, slots=True)
@@ -134,14 +140,14 @@ def create_batch(examples: List[Example]):
         for ex in examples
     ]
     return (
-        torch.tensor(tokens),
-        torch.tensor(segments),
-        torch.tensor(mask),
-        torch.tensor(labels),
+        torch.tensor(tokens, device=ARGS.device),
+        torch.tensor(segments, device=ARGS.device),
+        torch.tensor(mask, device=ARGS.device),
+        torch.tensor(labels, device=ARGS.device),
     )
 
 
-def train(model, data_loader, epochs):
+def train(model, train_data, eval_data, epochs):
     param_optimizer = list(model.named_parameters())
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
@@ -160,24 +166,27 @@ def train(model, data_loader, epochs):
     ]
 
     optimizer = BertAdam(
-        optimizer_grouped_parameters, lr=ARGS.learning_rate, warmup=0.1, t_total=len(data_loader)
+        optimizer_grouped_parameters,
+        lr=ARGS.learning_rate,
+        warmup=0.1,
+        t_total=len(train_data),
     )
 
     model.train()
 
     for epoch in trange(epochs, desc="Train epoch"):
-        for step, batch in enumerate(tqdm(data_loader, desc="Iteration")):
+        for step, batch in enumerate(tqdm(train_data, desc="Iteration")):
             loss = model(*batch)
-            print("loss", loss.item())
+            tqdm.write(f"loss={loss.item()}")
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
 
-            writer.add_scalar('train loss', loss.item(), step)
+            writer.add_scalar('train/loss', loss.item(), step)
 
         writer.add_graph('bert', model, batch[-1])
 
-        eval(model, data_loader)
+        eval(model, eval_data)
 
 
 def eval(model, data_loader):
@@ -187,22 +196,39 @@ def eval(model, data_loader):
     all_preds = []
     # all_probs = []
 
-    for step, batch in enumerate(tqdm(data_loader, desc="Eval")):
-        print('train batch shape', batch.shape)
-        with torch.no_grad():
+    with torch.no_grad():
+        for step, batch in enumerate(tqdm(data_loader, desc="Eval")):
             assert len(batch) == 4, "We should have labels here"
+            labels = batch[3]
+            targets = (
+                labels != -100
+            )  # the ignored index in the loss (= we ignore the tokens that not the target)
+
             logits = model(*batch[:3])
             # probs = F.softmax(logits, dim=1)[:,1]  # TODO check this
-            predictions = logits.argmax(dim=1).tolist()
+            predictions = logits.argmax(dim=-1)[targets].tolist()
             # all_probs += probs.tolist()
-        labels = batch[3].tolist()
+            labels = labels[targets].tolist()
 
-        all_preds += predictions
-        all_labels += labels
+            all_preds += predictions
+            all_labels += labels
 
     # writer.add_pr_curve('eval', labels=all_labels, predictions=all_probs)
-    writer.add_scalar('eval/acc', metrics.accuracy_score(all_labels, all_preds))
-    writer.add_scalar('eval/f1', metrics.f1_score(all_labels, all_preds))
+    tqdm.write(f"labels={' '.join(map(str, all_labels))}")
+    tqdm.write(f"preds ={' '.join(map(str, all_preds))}")
+    # writer.add_scalar('eval/acc', metrics.accuracy_score(all_labels, all_preds))
+    # writer.add_scalar('eval/f1 micro', metrics.f1_score(all_labels, all_preds, ))
+    for name, scorer in scorers.items():
+        writer.add_scalar(f'eval/{name}', scorer(all_labels, all_preds))
+    writer.add_text(
+        'eval/classification_report',
+        metrics.classification_report(
+            all_labels,
+            all_preds,
+            labels=[0, 1, 2],
+            target_names='None Positive Negative'.split(),
+        ),
+    )
 
 
 def main(args):
@@ -238,7 +264,7 @@ def main(args):
         # text = [ ('[MASK]' if tok in LOCATIONS else tok) for tok in ex['text'] ]
         ids = tokenizer.convert_tokens_to_ids(ex['text'])
         targets = [loc for loc in LOCATIONS if loc in ex['text']]
-        for target in targets:
+        for i, target in enumerate(targets):
             target_idx = ex['text'].index(target)
             for aspect in aspects:
                 sentiment_or_none = next(
@@ -261,40 +287,49 @@ def main(args):
                 )
 
     processed = ds.map_many(flatten_aspects)
+    if ARGS.debug:
+        processed.train = processed.train[: 2 * ARGS.batch_size]
+        processed.dev = processed.dev[: 2 * ARGS.batch_size]
+        processed.test = processed.test[: 2 * ARGS.batch_size]
 
     processed.print_head()
 
-    writer.add_text('params/bert_model', MODEL)
-    writer.add_text('params/batch_size', ARGS.batch_size)
-    writer.add_text('params/learning_rate', ARGS.learning_rate)
-    writer.add_text('params/weight_decay', ARGS.weight_decay)
+    writer.add_text('params', f"model={MODEL} params={str(ARGS)}")
 
-    model = BertForTokenClassification.from_pretrained(MODEL, num_labels=3)
     # 3 labels for None/neutral, Positive, Negative
+    model = BertForTokenClassification.from_pretrained(MODEL, num_labels=3)
+    model.to(ARGS.device)
 
-    # lm = BertForMaskedLM.from_pretrained(MODEL)
-    # lm.eval()
-    # for ex in processed.train:
-    #     tokens_tensor = torch.tensor([ex.token_ids])
-    #     segments_tensor = torch.tensor([segment_ids_from_token_ids(ex.token_ids)])
-    #     print(tokens_tensor)
-    #     print(segments_tensor)
+    if ARGS.balanced_sampler:
+        class_counts = Counter(ex.sentiment for ex in processed.train)
+        class_min = class_counts.most_common()[-1][1]
+        writer.add_text(
+            'info/balanced_sampler_weights',
+            str(
+                {
+                    sentiment: class_min / count
+                    for sentiment, count in class_counts.items()
+                }
+            ),
+        )
+        weights = [
+            len(processed.train) / class_counts[ex.sentiment] for ex in processed.train
+        ]
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights, num_samples=len(processed.train)
+        )
+    else:
+        sampler = None
 
-    #     predictions = lm(tokens_tensor)
-    #     print(predictions)
-    #     predicted_index = torch.argmax(predictions[0, ex.target_idx]).item()
-    #     predicted_token = tokenizer.convert_ids_to_tokens([predicted_index])
-
-    #     print(predicted_index)
-    #     print(predicted_token)
-    #     print(tokenizer.convert_ids_to_tokens(ex.token_ids), ex.text)
-
-    #     print(model(*create_batch([ex])))
-
-    #     break
-
-    loader = DataLoader(
-        processed.train, batch_size=batch_size, shuffle=True, collate_fn=create_batch
+    train_loader = DataLoader(
+        processed.train,
+        batch_size=ARGS.batch_size,
+        shuffle=not ARGS.balanced_sampler,
+        sampler=sampler,
+        collate_fn=create_batch,
+    )
+    eval_loader = DataLoader(
+        processed.dev, batch_size=ARGS.batch_size, collate_fn=create_batch
     )
 
-    train(model, loader, epochs=1)
+    train(model, train_loader, eval_loader, epochs=ARGS.epochs)
