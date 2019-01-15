@@ -172,9 +172,9 @@ def train(model, train_data, eval_data, epochs):
         t_total=len(train_data),
     )
 
-    model.train()
-
     for epoch in trange(epochs, desc="Train epoch"):
+        model.train()
+
         for step, batch in enumerate(tqdm(train_data, desc="Iteration")):
             loss = model(*batch)
             tqdm.write(f"loss={loss.item()}")
@@ -191,7 +191,6 @@ def train(model, train_data, eval_data, epochs):
 
 def eval(model, data_loader):
     model.eval()
-    # eval_metrics = Metrics()
     all_labels = []
     all_preds = []
     # all_probs = []
@@ -213,11 +212,8 @@ def eval(model, data_loader):
             all_preds += predictions
             all_labels += labels
 
-    # writer.add_pr_curve('eval', labels=all_labels, predictions=all_probs)
     tqdm.write(f"labels={' '.join(map(str, all_labels))}")
     tqdm.write(f"preds ={' '.join(map(str, all_preds))}")
-    # writer.add_scalar('eval/acc', metrics.accuracy_score(all_labels, all_preds))
-    # writer.add_scalar('eval/f1 micro', metrics.f1_score(all_labels, all_preds, ))
     for name, scorer in scorers.items():
         writer.add_scalar(f'eval/{name}', scorer(all_labels, all_preds))
     writer.add_text(
